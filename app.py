@@ -1,57 +1,96 @@
 import streamlit as st
 import pandas as pd
 from lxml import etree
-import io
+import json
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-st.set_page_config(page_title="Editor GHC", layout="wide")
-st.title("🎓 Gestor Visual de Horarios - Peñalara GHC")
+st.set_page_config(page_title="Editor GHC Cloud", layout="wide")
+st.title("☁️ Gestor Visual de Horarios - Nube Multiusuario")
 
-if "xml_tree" not in st.session_state:
-    st.session_state.xml_tree = None
-    st.session_state.data_frames = {}
+# --- CONEXIÓN A FIREBASE ---
+@st.cache_resource
+def iniciar_conexion_bd():
+    if not firebase_admin._apps:
+        llave_secreta = json.loads(st.secrets["FIREBASE_JSON"])
+        credenciales = credentials.Certificate(llave_secreta)
+        firebase_admin.initialize_app(credenciales)
+    return firestore.client()
 
-uploaded_file = st.file_uploader("📂 Sube tu archivo 'planificador.xml'", type=["xml"])
+db = iniciar_conexion_bd()
 
-if uploaded_file is not None and st.session_state.xml_tree is None:
-    parser = etree.XMLParser(encoding='iso-8859-1', strip_cdata=False)
-    tree = etree.parse(uploaded_file, parser)
-    root = tree.getroot()
-    st.session_state.xml_tree = tree
+def guardar_tabla_en_nube(nombre_tabla, dataframe):
+    # Guardamos la tabla directamente en Firestore
+    db.collection('ghc_tablas').document(nombre_tabla).set({'datos': dataframe.to_dict('records')})
+
+def cargar_datos_de_nube():
+    doc_xml = db.collection('ghc_sistema').document('plantilla_base').get()
+    if not doc_xml.exists: return None, None
     
+    xml_string = doc_xml.to_dict().get('xml')
+    tree = etree.ElementTree(etree.fromstring(xml_string.encode('ISO-8859-1')))
+    
+    coleccion = db.collection('ghc_tablas').stream()
     dfs = {}
-    for container in root:
-        if len(container) > 0:
-            tag_hijo = container[0].tag
-            registros = []
-            for i, item in enumerate(container.findall(tag_hijo)):
-                fila = {}
-                identificador = item.get('id') or item.findtext('nombre') or item.get('nombre') or item.get('abreviatura') or f"Elemento_{i}"
-                fila['ID_SISTEMA'] = identificador
-                
-                for k, v in item.attrib.items():
-                    fila[f"@{k}"] = v
-                for child in item:
-                    if child.tag in ['listaDeAulas', 'otrasAulas']:
-                        fila[child.tag] = ", ".join([c.text for c in child.findall('aula') if c.text])
-                    elif child.tag == 'otrosProfesores':
-                        fila[child.tag] = ", ".join([c.text for c in child.findall('profesor') if c.text])
-                    elif child.tag == 'otrosGrupos':
-                        fila[child.tag] = ", ".join([c.text for c in child.findall('grupo') if c.text])
-                    elif len(child) == 0:
-                        fila[child.tag] = child.text.strip() if child.text else ""
-                    else:
-                        inner_xml = (child.text or '') + ''.join([etree.tostring(c, encoding='unicode') for c in child])
-                        fila[child.tag] = inner_xml.strip()
-                registros.append(fila)
-            if registros:
-                dfs[container.tag.capitalize()] = pd.DataFrame(registros).fillna("")
-    
-    st.session_state.data_frames = dfs
-    st.rerun()
+    for doc in coleccion:
+        dfs[doc.id] = pd.DataFrame(doc.to_dict().get('datos', [])).fillna("")
+    return tree, dfs
 
-if st.session_state.xml_tree is not None:
-    st.success("✅ Base de datos lista. Edita directamente en la tabla o usa el Inspector para los subcampos.")
+# --- MEMORIA DE LA SESIÓN ---
+if "bd_cargada" not in st.session_state:
+    st.session_state.xml_tree, st.session_state.data_frames = cargar_datos_de_nube()
+    st.session_state.bd_cargada = True
+
+# --- PANTALLA DE INICIO (Base de datos vacía) ---
+if st.session_state.xml_tree is None:
+    st.info("☁️ La base de datos central está vacía. Sube tu archivo XML de Peñalara por primera vez para inicializar el sistema colaborativo.")
+    uploaded_file = st.file_uploader("📂 Sube tu archivo 'planificador.xml'", type=["xml"])
     
+    if uploaded_file is not None:
+        parser = etree.XMLParser(encoding='iso-8859-1', strip_cdata=False)
+        tree = etree.parse(uploaded_file, parser)
+        root = tree.getroot()
+        
+        # Extraer datos y crear DataFrames
+        dfs = {}
+        for container in root:
+            if len(container) > 0:
+                tag_hijo = container[0].tag
+                registros = []
+                for i, item in enumerate(container.findall(tag_hijo)):
+                    fila = {}
+                    identificador = item.get('id') or item.findtext('nombre') or item.get('nombre') or item.get('abreviatura') or f"Elemento_{i}"
+                    fila['ID_SISTEMA'] = identificador
+                    for k, v in item.attrib.items(): fila[f"@{k}"] = v
+                    for child in item:
+                        if child.tag in ['listaDeAulas', 'otrasAulas']: fila[child.tag] = ", ".join([c.text for c in child.findall('aula') if c.text])
+                        elif child.tag == 'otrosProfesores': fila[child.tag] = ", ".join([c.text for c in child.findall('profesor') if c.text])
+                        elif child.tag == 'otrosGrupos': fila[child.tag] = ", ".join([c.text for c in child.findall('grupo') if c.text])
+                        elif len(child) == 0: fila[child.tag] = child.text.strip() if child.text else ""
+                        else: fila[child.tag] = (child.text or '') + ''.join([etree.tostring(c, encoding='unicode') for c in child])
+                    registros.append(fila)
+                if registros:
+                    dfs[container.tag.capitalize()] = pd.DataFrame(registros).fillna("")
+        
+        # Subir todo a Firebase
+        xml_base = etree.tostring(root, encoding='ISO-8859-1').decode('ISO-8859-1')
+        db.collection('ghc_sistema').document('plantilla_base').set({'xml': xml_base})
+        for nombre, df in dfs.items(): guardar_tabla_en_nube(nombre, df)
+        
+        st.session_state.xml_tree = tree
+        st.session_state.data_frames = dfs
+        st.rerun()
+
+# --- PANTALLA PRINCIPAL DE EDICIÓN ---
+if st.session_state.xml_tree is not None:
+    st.success("✅ Base de datos conectada. Los cambios que hagas se guardarán automáticamente en la nube y serán visibles para otros usuarios.")
+    
+    # Botón para borrar la base de datos y empezar de cero si cambias de curso escolar
+    if st.button("🚨 Resetear Base de Datos (Subir XML nuevo)", type="secondary"):
+        db.collection('ghc_sistema').document('plantilla_base').delete()
+        st.session_state.xml_tree = None
+        st.rerun()
+        
     tab_names = list(st.session_state.data_frames.keys())
     tabs = st.tabs(tab_names)
     
@@ -63,13 +102,15 @@ if st.session_state.xml_tree is not None:
             col_tabla, col_inspector = st.columns([2, 1])
             
             with col_tabla:
-                st.markdown("### 📋 Tabla Editable")
-                st.caption("Modifica celdas normales haciendo doble clic. Para los datos anidados (<...>), usa el panel de la derecha 👉")
-                # Hacemos la tabla 100% editable
+                st.markdown("### 📋 Tabla Colaborativa")
+                st.caption("Los cambios en estas celdas se sincronizan con la base de datos.")
                 df_editado = st.data_editor(df, use_container_width=True, hide_index=True, key=f"editor_{i}")
-                # Guardar cambios directos de la tabla en memoria
+                
+                # Si detecta cambios en la tabla, actualiza Firebase
                 if not df_editado.equals(df):
                     st.session_state.data_frames[tab_names[i]] = df_editado
+                    guardar_tabla_en_nube(tab_names[i], df_editado)
+                    st.toast('☁️ ¡Cambio guardado en la nube!')
             
             with col_inspector:
                 st.markdown("### 🔍 Inspector de Subcampos")
@@ -82,64 +123,53 @@ if st.session_state.xml_tree is not None:
                     
                     with st.form(key=f"form_{i}_{seleccion}"):
                         nuevos_valores_xml = {}
-                        
                         for col_name in df.columns:
                             valor_actual = str(df.at[idx, col_name])
-                            
-                            # Solo filtramos y mostramos los que son subanidados (contienen etiquetas XML)
                             if "<" in valor_actual and ">" in valor_actual:
                                 campos_anidados_encontrados = True
                                 st.markdown(f"**📂 {col_name.capitalize()}**")
-                                
                                 try:
-                                    # Despiezamos el XML anidado de forma invisible
                                     sub_tree = etree.fromstring(f"<root>{valor_actual}</root>")
                                     dict_subcampos = {}
                                     for child in sub_tree:
                                         val = child.text if child.text else ""
-                                        # Creamos campos limpios sin corchetes
-                                        nuevo_val = st.text_input(f"↳ {child.tag}", value=val, key=f"input_{i}_{col_name}_{child.tag}")
-                                        dict_subcampos[child.tag] = nuevo_val
+                                        dict_subcampos[child.tag] = st.text_input(f"↳ {child.tag}", value=val, key=f"inp_{i}_{col_name}_{child.tag}")
                                     nuevos_valores_xml[col_name] = dict_subcampos
                                 except:
-                                    # Si es muy complejo y falla, lo mostramos como texto
                                     nuevos_valores_xml[col_name] = st.text_area(f"🔧 {col_name} (Avanzado)", value=valor_actual)
                         
                         if not campos_anidados_encontrados:
-                            st.info("Este elemento no tiene campos anidados complejos. Puedes editarlo directamente en la tabla.")
+                            st.info("Sin campos complejos. Edita en la tabla izquierda.")
                             st.form_submit_button("Cerrar", disabled=True)
                         else:
-                            if st.form_submit_button("💾 Empaquetar y Guardar", type="primary"):
-                                # Volvemos a juntar los subcampos en XML y lo inyectamos a la tabla
+                            if st.form_submit_button("💾 Guardar en la Nube", type="primary"):
                                 for col_name, subcampos in nuevos_valores_xml.items():
                                     if isinstance(subcampos, dict):
-                                        xml_str = ""
-                                        for tag, val in subcampos.items():
-                                            xml_str += f"<{tag}>{val}</{tag}>"
+                                        xml_str = "".join([f"<{tag}>{val}</{tag}>" for tag, val in subcampos.items()])
                                         st.session_state.data_frames[tab_names[i]].at[idx, col_name] = xml_str
                                     else:
                                         st.session_state.data_frames[tab_names[i]].at[idx, col_name] = subcampos
+                                
+                                # Enviar actualización a Firebase
+                                guardar_tabla_en_nube(tab_names[i], st.session_state.data_frames[tab_names[i]])
                                 st.rerun()
 
     st.divider()
     
-    if st.button("📦 DESCARGAR XML FINAL PARA PEÑALARA", type="secondary"):
+    # EXPORTACIÓN
+    if st.button("📦 DESCARGAR XML PARA PEÑALARA", type="primary"):
         root = st.session_state.xml_tree.getroot()
         for tab_name, df_editado in st.session_state.data_frames.items():
             nombre_pestana = tab_name.lower()
             container = root.find(nombre_pestana)
             if container is None: continue
             tag_hijo = container[0].tag
-            datos = df_editado.to_dict('records')
             
-            for fila in datos:
+            for fila in df_editado.to_dict('records'):
                 id_sistema = str(fila.get('ID_SISTEMA', ''))
                 if not id_sistema or id_sistema.startswith("Elemento_"): continue
                 
-                nodo = container.find(f"{tag_hijo}[@id='{id_sistema}']")
-                if nodo is None: nodo = container.find(f"{tag_hijo}[nombre='{id_sistema}']")
-                if nodo is None: nodo = container.find(f"{tag_hijo}[@nombre='{id_sistema}']")
-                if nodo is None: nodo = container.find(f"{tag_hijo}[@abreviatura='{id_sistema}']")
+                nodo = container.find(f"{tag_hijo}[@id='{id_sistema}']") or container.find(f"{tag_hijo}[nombre='{id_sistema}']") or container.find(f"{tag_hijo}[@nombre='{id_sistema}']") or container.find(f"{tag_hijo}[@abreviatura='{id_sistema}']")
                     
                 if nodo is not None:
                     for col, valor in fila.items():
@@ -153,20 +183,14 @@ if st.session_state.xml_tree is not None:
                                 for c in list(lista_nodo): lista_nodo.remove(c)
                                 for a in valor_str.split(','):
                                     if a.strip(): etree.SubElement(lista_nodo, 'aula').text = a.strip()
-                        elif col == 'otrosProfesores':
+                        elif col in ['otrosProfesores', 'otrosGrupos']:
+                            tag_interno = 'profesor' if col == 'otrosProfesores' else 'grupo'
                             lista_nodo = nodo.find(col)
                             if lista_nodo is None and valor_str: lista_nodo = etree.SubElement(nodo, col)
                             if lista_nodo is not None:
                                 for c in list(lista_nodo): lista_nodo.remove(c)
-                                for p in valor_str.split(','):
-                                    if p.strip(): etree.SubElement(lista_nodo, 'profesor').text = p.strip()
-                        elif col == 'otrosGrupos':
-                            lista_nodo = nodo.find(col)
-                            if lista_nodo is None and valor_str: lista_nodo = etree.SubElement(nodo, col)
-                            if lista_nodo is not None:
-                                for c in list(lista_nodo): lista_nodo.remove(c)
-                                for g in valor_str.split(','):
-                                    if g.strip(): etree.SubElement(lista_nodo, 'grupo').text = g.strip()
+                                for item_val in valor_str.split(','):
+                                    if item_val.strip(): etree.SubElement(lista_nodo, tag_interno).text = item_val.strip()
                         else:
                             hijo = nodo.find(col)
                             if '<' in valor_str and '>' in valor_str:
@@ -179,8 +203,7 @@ if st.session_state.xml_tree is not None:
                             if hijo is not None:
                                 for c in list(hijo): hijo.remove(c)
                                 hijo.text = valor_str
-                            elif valor_str:
-                                etree.SubElement(nodo, col).text = valor_str
+                            elif valor_str: etree.SubElement(nodo, col).text = valor_str
 
         xml_str = etree.tostring(root, encoding='ISO-8859-1', xml_declaration=True, pretty_print=True)
-        st.download_button(label="📥 HAZ CLIC AQUÍ PARA DESCARGAR EL ARCHIVO", data=xml_str, file_name="PLANIFICADOR_ACTUALIZADO.xml", mime="application/xml")
+        st.download_button(label="📥 HAZ CLIC AQUÍ PARA DESCARGAR EL ARCHIVO FINAL", data=xml_str, file_name="PLANIFICADOR_NUBE.xml", mime="application/xml")
