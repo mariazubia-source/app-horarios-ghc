@@ -3,16 +3,14 @@ import pandas as pd
 from lxml import etree
 import io
 
-# Configuración de la pantalla visual
 st.set_page_config(page_title="Editor GHC", layout="wide")
 st.title("🎓 Gestor Visual de Horarios - Peñalara GHC")
 
-# Memoria de la aplicación
 if "xml_tree" not in st.session_state:
     st.session_state.xml_tree = None
     st.session_state.data_frames = {}
 
-uploaded_file = st.file_uploader("📂 Sube tu archivo 'planificador.xml' (Fase 1: Memoria Temporal)", type=["xml"])
+uploaded_file = st.file_uploader("📂 Sube tu archivo 'planificador.xml'", type=["xml"])
 
 if uploaded_file is not None and st.session_state.xml_tree is None:
     parser = etree.XMLParser(encoding='iso-8859-1', strip_cdata=False)
@@ -27,7 +25,6 @@ if uploaded_file is not None and st.session_state.xml_tree is None:
             registros = []
             for i, item in enumerate(container.findall(tag_hijo)):
                 fila = {}
-                # SUPER RADAR: Captura ID, nombre, abreviatura, o inventa uno si Peñalara lo oculta
                 identificador = item.get('id') or item.findtext('nombre') or item.get('nombre') or item.get('abreviatura') or f"Elemento_{i}"
                 fila['ID_SISTEMA'] = identificador
                 
@@ -53,7 +50,7 @@ if uploaded_file is not None and st.session_state.xml_tree is None:
     st.rerun()
 
 if st.session_state.xml_tree is not None:
-    st.success("✅ Datos cargados correctamente. Entorno de edición visual activado.")
+    st.success("✅ Base de datos lista. Edita directamente en la tabla o usa el Inspector para los subcampos.")
     
     tab_names = list(st.session_state.data_frames.keys())
     tabs = st.tabs(tab_names)
@@ -63,41 +60,69 @@ if st.session_state.xml_tree is not None:
             df = st.session_state.data_frames[tab_names[i]]
             if df.empty: continue
             
-            # PANTALLA DIVIDIDA
-            col1, col2 = st.columns([1.2, 1])
+            col_tabla, col_inspector = st.columns([2, 1])
             
-            with col1:
-                st.markdown("### 📋 Tabla General (Solo lectura)")
-                st.dataframe(df, use_container_width=True, hide_index=True)
+            with col_tabla:
+                st.markdown("### 📋 Tabla Editable")
+                st.caption("Modifica celdas normales haciendo doble clic. Para los datos anidados (<...>), usa el panel de la derecha 👉")
+                # Hacemos la tabla 100% editable
+                df_editado = st.data_editor(df, use_container_width=True, hide_index=True, key=f"editor_{i}")
+                # Guardar cambios directos de la tabla en memoria
+                if not df_editado.equals(df):
+                    st.session_state.data_frames[tab_names[i]] = df_editado
             
-            with col2:
-                st.markdown("### 🛠️ Panel de Edición Detallada")
+            with col_inspector:
+                st.markdown("### 🔍 Inspector de Subcampos")
                 opciones = df['ID_SISTEMA'].tolist()
-                seleccion = st.selectbox("Selecciona qué elemento quieres editar:", ["-- Elige uno --"] + opciones, key=f"sel_{i}")
+                seleccion = st.selectbox("Elige la fila a inspeccionar:", ["-- Ninguna --"] + opciones, key=f"sel_{i}")
                 
-                if seleccion != "-- Elige uno --":
-                    fila_actual = df[df['ID_SISTEMA'] == seleccion].iloc[0]
+                if seleccion != "-- Ninguna --":
+                    idx = df[df['ID_SISTEMA'] == seleccion].index[0]
+                    campos_anidados_encontrados = False
+                    
                     with st.form(key=f"form_{i}_{seleccion}"):
-                        nuevos_valores = {}
-                        for col_name in df.columns:
-                            if col_name == 'ID_SISTEMA': continue
-                            valor_actual = str(fila_actual[col_name])
-                            
-                            # Cajas grandes para etiquetas complejas, pequeñas para textos cortos
-                            if "<" in valor_actual and ">" in valor_actual:
-                                nuevos_valores[col_name] = st.text_area(f"🔧 {col_name} (Avanzado)", value=valor_actual, height=150)
-                            else:
-                                nuevos_valores[col_name] = st.text_input(f"📄 {col_name}", value=valor_actual)
+                        nuevos_valores_xml = {}
                         
-                        if st.form_submit_button("💾 Guardar Cambios en Memoria", type="primary"):
-                            idx = df[df['ID_SISTEMA'] == seleccion].index[0]
-                            for k, v in nuevos_valores.items():
-                                st.session_state.data_frames[tab_names[i]].at[idx, k] = v
-                            st.rerun()
+                        for col_name in df.columns:
+                            valor_actual = str(df.at[idx, col_name])
+                            
+                            # Solo filtramos y mostramos los que son subanidados (contienen etiquetas XML)
+                            if "<" in valor_actual and ">" in valor_actual:
+                                campos_anidados_encontrados = True
+                                st.markdown(f"**📂 {col_name.capitalize()}**")
+                                
+                                try:
+                                    # Despiezamos el XML anidado de forma invisible
+                                    sub_tree = etree.fromstring(f"<root>{valor_actual}</root>")
+                                    dict_subcampos = {}
+                                    for child in sub_tree:
+                                        val = child.text if child.text else ""
+                                        # Creamos campos limpios sin corchetes
+                                        nuevo_val = st.text_input(f"↳ {child.tag}", value=val, key=f"input_{i}_{col_name}_{child.tag}")
+                                        dict_subcampos[child.tag] = nuevo_val
+                                    nuevos_valores_xml[col_name] = dict_subcampos
+                                except:
+                                    # Si es muy complejo y falla, lo mostramos como texto
+                                    nuevos_valores_xml[col_name] = st.text_area(f"🔧 {col_name} (Avanzado)", value=valor_actual)
+                        
+                        if not campos_anidados_encontrados:
+                            st.info("Este elemento no tiene campos anidados complejos. Puedes editarlo directamente en la tabla.")
+                            st.form_submit_button("Cerrar", disabled=True)
+                        else:
+                            if st.form_submit_button("💾 Empaquetar y Guardar", type="primary"):
+                                # Volvemos a juntar los subcampos en XML y lo inyectamos a la tabla
+                                for col_name, subcampos in nuevos_valores_xml.items():
+                                    if isinstance(subcampos, dict):
+                                        xml_str = ""
+                                        for tag, val in subcampos.items():
+                                            xml_str += f"<{tag}>{val}</{tag}>"
+                                        st.session_state.data_frames[tab_names[i]].at[idx, col_name] = xml_str
+                                    else:
+                                        st.session_state.data_frames[tab_names[i]].at[idx, col_name] = subcampos
+                                st.rerun()
 
     st.divider()
     
-    # Exportación (Necesario hasta que integremos la Base de Datos en la Fase 2)
     if st.button("📦 DESCARGAR XML FINAL PARA PEÑALARA", type="secondary"):
         root = st.session_state.xml_tree.getroot()
         for tab_name, df_editado in st.session_state.data_frames.items():
