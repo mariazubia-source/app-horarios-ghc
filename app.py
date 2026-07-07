@@ -28,7 +28,6 @@ def cargar_datos_de_nube():
     doc_xml = db.collection('ghc_sistema').document('plantilla_base').get()
     if not doc_xml.exists: return None, None
     
-    # Descomprimir el XML guardado
     datos_doc = doc_xml.to_dict()
     xml_comprimido = datos_doc.get('xml_comprimido')
     
@@ -50,7 +49,7 @@ if "bd_cargada" not in st.session_state:
     st.session_state.xml_tree, st.session_state.data_frames = cargar_datos_de_nube()
     st.session_state.bd_cargada = True
 
-# --- PANTALLA DE INICIO (Base de datos vacía) ---
+# --- PANTALLA DE INICIO ---
 if st.session_state.xml_tree is None:
     st.info("☁️ La base de datos central está vacía. Sube tu archivo XML de Peñalara por primera vez.")
     uploaded_file = st.file_uploader("📂 Sube tu archivo 'planificador.xml'", type=["xml"])
@@ -80,7 +79,6 @@ if st.session_state.xml_tree is None:
                 if registros:
                     dfs[container.tag.capitalize()] = pd.DataFrame(registros).fillna("")
         
-        # Comprimir el XML antes de enviarlo a Firebase
         xml_bytes = etree.tostring(root, encoding='ISO-8859-1')
         xml_comprimido = base64.b64encode(zlib.compress(xml_bytes)).decode('utf-8')
         
@@ -93,9 +91,9 @@ if st.session_state.xml_tree is None:
 
 # --- PANTALLA PRINCIPAL DE EDICIÓN ---
 if st.session_state.xml_tree is not None:
-    st.success("✅ Base de datos conectada. Los cambios que hagas se guardarán automáticamente en la nube y serán visibles para otros usuarios.")
+    st.success("✅ Base de datos conectada. Los cambios se guardan automáticamente.")
     
-    if st.button("🚨 Resetear Base de Datos (Subir XML nuevo)", type="secondary"):
+    if st.button("🚨 Resetear Base de Datos", type="secondary"):
         db.collection('ghc_sistema').document('plantilla_base').delete()
         st.session_state.xml_tree = None
         st.rerun()
@@ -108,22 +106,25 @@ if st.session_state.xml_tree is not None:
             df = st.session_state.data_frames[tab_names[i]]
             if df.empty: continue
             
-            col_tabla, col_inspector = st.columns([2, 1])
+            # --- MEJORA UX 1: Título Semántico ---
+            st.markdown(f"### 📋 Gestor de {tab_names[i]}")
+            st.caption("Edita directamente en las celdas. Los cambios se sincronizan en la nube al pulsar Enter o salir de la celda.")
             
-            with col_tabla:
-                st.markdown("### 📋 Tabla Colaborativa")
-                st.caption("Los cambios en estas celdas se sincronizan con la base de datos.")
-                df_editado = st.data_editor(df, use_container_width=True, hide_index=True, key=f"editor_{i}")
-                
-                if not df_editado.equals(df):
-                    st.session_state.data_frames[tab_names[i]] = df_editado
-                    guardar_tabla_en_nube(tab_names[i], df_editado)
-                    st.toast('☁️ ¡Cambio guardado en la nube!')
+            # --- MEJORA UX 2: Tabla a pantalla completa ---
+            df_editado = st.data_editor(df, use_container_width=True, hide_index=True, key=f"editor_{i}")
             
-            with col_inspector:
-                st.markdown("### 🔍 Inspector de Subcampos")
+            if not df_editado.equals(df):
+                st.session_state.data_frames[tab_names[i]] = df_editado
+                guardar_tabla_en_nube(tab_names[i], df_editado)
+                st.toast('☁️ ¡Cambio guardado en la nube!')
+            
+            st.write("") # Espacio en blanco para dar aire visual
+            
+            # --- MEJORA UX 3: Inspector en Acordeón (Desplegable) ---
+            with st.expander(f"🛠️ Editar configuraciones avanzadas (subcampos) de {tab_names[i]}", expanded=False):
+                st.markdown("Selecciona un elemento para desglosar su información interna.")
                 opciones = df['ID_SISTEMA'].tolist()
-                seleccion = st.selectbox("Elige la fila a inspeccionar:", ["-- Ninguna --"] + opciones, key=f"sel_{i}")
+                seleccion = st.selectbox("Elemento a inspeccionar:", ["-- Ninguna --"] + opciones, key=f"sel_{i}")
                 
                 if seleccion != "-- Ninguna --":
                     idx = df[df['ID_SISTEMA'] == seleccion].index[0]
@@ -139,18 +140,27 @@ if st.session_state.xml_tree is not None:
                                 try:
                                     sub_tree = etree.fromstring(f"<root>{valor_actual}</root>")
                                     dict_subcampos = {}
+                                    
+                                    # Usamos columnas dentro del formulario para que quede más compacto
+                                    cols_form = st.columns(3)
+                                    col_idx = 0
+                                    
                                     for child in sub_tree:
                                         val = child.text if child.text else ""
-                                        dict_subcampos[child.tag] = st.text_input(f"↳ {child.tag}", value=val, key=f"inp_{i}_{col_name}_{child.tag}")
+                                        with cols_form[col_idx % 3]:
+                                            dict_subcampos[child.tag] = st.text_input(f"↳ {child.tag}", value=val, key=f"inp_{i}_{col_name}_{child.tag}")
+                                        col_idx += 1
+                                        
                                     nuevos_valores_xml[col_name] = dict_subcampos
                                 except:
                                     nuevos_valores_xml[col_name] = st.text_area(f"🔧 {col_name} (Avanzado)", value=valor_actual)
                         
                         if not campos_anidados_encontrados:
-                            st.info("Sin campos complejos. Edita en la tabla izquierda.")
+                            st.info("Este elemento no tiene configuraciones complejas ocultas. Puedes editarlo cómodamente en la tabla superior.")
                             st.form_submit_button("Cerrar", disabled=True)
                         else:
-                            if st.form_submit_button("💾 Guardar en la Nube", type="primary"):
+                            st.write("")
+                            if st.form_submit_button("💾 Aplicar y Guardar en la Nube", type="primary"):
                                 for col_name, subcampos in nuevos_valores_xml.items():
                                     if isinstance(subcampos, dict):
                                         xml_str = "".join([f"<{tag}>{val}</{tag}>" for tag, val in subcampos.items()])
