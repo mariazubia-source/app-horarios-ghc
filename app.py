@@ -4,6 +4,8 @@ from lxml import etree
 import json
 import firebase_admin
 from firebase_admin import credentials, firestore
+import zlib
+import base64
 
 st.set_page_config(page_title="Editor GHC Cloud", layout="wide")
 st.title("☁️ Gestor Visual de Horarios - Nube Multiusuario")
@@ -20,15 +22,22 @@ def iniciar_conexion_bd():
 db = iniciar_conexion_bd()
 
 def guardar_tabla_en_nube(nombre_tabla, dataframe):
-    # Guardamos la tabla directamente en Firestore
     db.collection('ghc_tablas').document(nombre_tabla).set({'datos': dataframe.to_dict('records')})
 
 def cargar_datos_de_nube():
     doc_xml = db.collection('ghc_sistema').document('plantilla_base').get()
     if not doc_xml.exists: return None, None
     
-    xml_string = doc_xml.to_dict().get('xml')
-    tree = etree.ElementTree(etree.fromstring(xml_string.encode('ISO-8859-1')))
+    # Descomprimir el XML guardado
+    datos_doc = doc_xml.to_dict()
+    xml_comprimido = datos_doc.get('xml_comprimido')
+    
+    try:
+        xml_bytes = zlib.decompress(base64.b64decode(xml_comprimido))
+        tree = etree.ElementTree(etree.fromstring(xml_bytes))
+    except Exception as e:
+        st.error(f"Error al descomprimir la base de datos: {e}")
+        return None, None
     
     coleccion = db.collection('ghc_tablas').stream()
     dfs = {}
@@ -43,7 +52,7 @@ if "bd_cargada" not in st.session_state:
 
 # --- PANTALLA DE INICIO (Base de datos vacía) ---
 if st.session_state.xml_tree is None:
-    st.info("☁️ La base de datos central está vacía. Sube tu archivo XML de Peñalara por primera vez para inicializar el sistema colaborativo.")
+    st.info("☁️ La base de datos central está vacía. Sube tu archivo XML de Peñalara por primera vez.")
     uploaded_file = st.file_uploader("📂 Sube tu archivo 'planificador.xml'", type=["xml"])
     
     if uploaded_file is not None:
@@ -51,7 +60,6 @@ if st.session_state.xml_tree is None:
         tree = etree.parse(uploaded_file, parser)
         root = tree.getroot()
         
-        # Extraer datos y crear DataFrames
         dfs = {}
         for container in root:
             if len(container) > 0:
@@ -72,9 +80,11 @@ if st.session_state.xml_tree is None:
                 if registros:
                     dfs[container.tag.capitalize()] = pd.DataFrame(registros).fillna("")
         
-        # Subir todo a Firebase
-        xml_base = etree.tostring(root, encoding='ISO-8859-1').decode('ISO-8859-1')
-        db.collection('ghc_sistema').document('plantilla_base').set({'xml': xml_base})
+        # Comprimir el XML antes de enviarlo a Firebase
+        xml_bytes = etree.tostring(root, encoding='ISO-8859-1')
+        xml_comprimido = base64.b64encode(zlib.compress(xml_bytes)).decode('utf-8')
+        
+        db.collection('ghc_sistema').document('plantilla_base').set({'xml_comprimido': xml_comprimido})
         for nombre, df in dfs.items(): guardar_tabla_en_nube(nombre, df)
         
         st.session_state.xml_tree = tree
@@ -85,7 +95,6 @@ if st.session_state.xml_tree is None:
 if st.session_state.xml_tree is not None:
     st.success("✅ Base de datos conectada. Los cambios que hagas se guardarán automáticamente en la nube y serán visibles para otros usuarios.")
     
-    # Botón para borrar la base de datos y empezar de cero si cambias de curso escolar
     if st.button("🚨 Resetear Base de Datos (Subir XML nuevo)", type="secondary"):
         db.collection('ghc_sistema').document('plantilla_base').delete()
         st.session_state.xml_tree = None
@@ -106,7 +115,6 @@ if st.session_state.xml_tree is not None:
                 st.caption("Los cambios en estas celdas se sincronizan con la base de datos.")
                 df_editado = st.data_editor(df, use_container_width=True, hide_index=True, key=f"editor_{i}")
                 
-                # Si detecta cambios en la tabla, actualiza Firebase
                 if not df_editado.equals(df):
                     st.session_state.data_frames[tab_names[i]] = df_editado
                     guardar_tabla_en_nube(tab_names[i], df_editado)
@@ -150,13 +158,11 @@ if st.session_state.xml_tree is not None:
                                     else:
                                         st.session_state.data_frames[tab_names[i]].at[idx, col_name] = subcampos
                                 
-                                # Enviar actualización a Firebase
                                 guardar_tabla_en_nube(tab_names[i], st.session_state.data_frames[tab_names[i]])
                                 st.rerun()
 
     st.divider()
     
-    # EXPORTACIÓN
     if st.button("📦 DESCARGAR XML PARA PEÑALARA", type="primary"):
         root = st.session_state.xml_tree.getroot()
         for tab_name, df_editado in st.session_state.data_frames.items():
