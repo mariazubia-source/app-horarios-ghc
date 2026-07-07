@@ -36,7 +36,7 @@ def cargar_datos_de_nube():
         xml_bytes = zlib.decompress(base64.b64decode(xml_comprimido))
         tree = etree.ElementTree(etree.fromstring(xml_bytes))
     except Exception as e:
-        st.error(f"Error al descomprimir la base de datos: {e}")
+        st.error(f"Error al descomprimir: {e}")
         return None, None
     
     coleccion = db.collection('ghc_tablas').stream()
@@ -45,79 +45,81 @@ def cargar_datos_de_nube():
         dfs[doc.id] = pd.DataFrame(doc.to_dict().get('datos', [])).fillna("")
     return tree, dfs
 
-# --- MOTOR RECURSIVO PARA ANIDAMIENTO PROFUNDO ---
-def render_recursive_xml_form(node, path_key, depth=0):
-    """Dibuja de forma infinita inputs para XML jerárquicos (ej. restricciones y plantillas)"""
-    indent = "&nbsp;" * (depth * 6)
+# --- CONVERSORES DE XML A SUB-TABLAS ---
+def xml_to_df(xml_str):
+    tree = etree.fromstring(xml_str)
+    parent_tag = tree.tag
+    rows = []
+    for child in tree:
+        row = {'Etiqueta': child.tag, 'Valor_Texto': child.text if child.text else ""}
+        for k, v in child.attrib.items():
+            row[f"@{k}"] = v
+        if len(child) > 0:
+            row['Sub_Nodos_Ocultos'] = "".join([etree.tostring(c, encoding='unicode') for c in child])
+        rows.append(row)
     
-    # 1. Dibujar Atributos (Muy comunes en Peñalara para definir plantillas)
-    if node.attrib:
-        for k, v in node.attrib.items():
-            c1, c2 = st.columns([1, 3])
-            with c1: st.markdown(f"{indent}⚙️ `@<b>{k}</b>`", unsafe_allow_html=True)
-            with c2: node.attrib[k] = st.text_input(f"{k}", value=v, key=f"attr_{path_key}_{k}", label_visibility="collapsed")
-            
-    # 2. Dibujar Hijos o Valor de texto
-    if len(node) > 0:
-        for i, child in enumerate(node):
-            st.markdown(f"{indent}📂 <b>{child.tag}</b>", unsafe_allow_html=True)
-            # Llamada recursiva para procesar a los "nietos", "bisnietos", etc.
-            render_recursive_xml_form(child, f"{path_key}_{i}_{child.tag}", depth + 1)
-    else:
-        # Si es un elemento final (sin hijos), mostramos su caja de texto
-        c1, c2 = st.columns([1, 3])
-        with c1: st.markdown(f"{indent}↳ {node.tag}", unsafe_allow_html=True)
-        with c2: node.text = st.text_input(f"{node.tag}", value=node.text or "", key=f"val_{path_key}", label_visibility="collapsed")
+    if not rows:
+        return parent_tag, pd.DataFrame(columns=['Etiqueta', 'Valor_Texto'])
+    return parent_tag, pd.DataFrame(rows).fillna("")
 
-# --- MEMORIA DE LA SESIÓN ---
+def df_to_xml(parent_tag, df):
+    root = etree.Element(parent_tag)
+    for _, row in df.iterrows():
+        tag = str(row.get('Etiqueta', '')).strip()
+        if not tag or tag.lower() == 'nan': continue
+        
+        child = etree.SubElement(root, tag)
+        val = str(row.get('Valor_Texto', '')).strip()
+        if val and val.lower() != 'nan':
+            child.text = val
+            
+        for col in df.columns:
+            if col.startswith('@'):
+                attr_val = str(row.get(col, '')).strip()
+                if attr_val and attr_val.lower() != 'nan':
+                    child.set(col[1:], attr_val)
+            elif col == 'Sub_Nodos_Ocultos':
+                sub_val = str(row.get(col, '')).strip()
+                if sub_val and sub_val.lower() != 'nan':
+                    try:
+                        sub_tree = etree.fromstring(f"<wrapper>{sub_val}</wrapper>")
+                        for sub_c in sub_tree: child.append(sub_c)
+                    except: pass
+    return etree.tostring(root, encoding='unicode')
+
+# --- INICIO DE SESIÓN ---
 if "bd_cargada" not in st.session_state:
     st.session_state.xml_tree, st.session_state.data_frames = cargar_datos_de_nube()
     st.session_state.bd_cargada = True
 
-# --- PANTALLA DE INICIO ---
+# --- PANTALLA DE CARGA ---
 if st.session_state.xml_tree is None:
-    st.info("☁️ La base de datos central está vacía. Sube tu archivo XML de Peñalara por primera vez.")
-    uploaded_file = st.file_uploader("📂 Sube tu archivo 'planificador.xml'", type=["xml"])
+    st.info("☁️ La base de datos central está vacía. Sube tu archivo XML de Peñalara.")
+    uploaded_file = st.file_uploader("📂 Sube tu 'planificador.xml'", type=["xml"])
     
     if uploaded_file is not None:
         parser = etree.XMLParser(encoding='iso-8859-1', strip_cdata=False)
         tree = etree.parse(uploaded_file, parser)
         root = tree.getroot()
-        
         dfs = {}
         for container in root:
             if len(container) > 0:
                 tag_hijo = container[0].tag
                 registros = []
                 for i, item in enumerate(container.findall(tag_hijo)):
-                    fila = {}
-                    identificador = item.get('id') or item.findtext('nombre') or item.get('nombre') or item.get('abreviatura') or f"Elemento_{i}"
-                    fila['ID_SISTEMA'] = identificador
-                    
-                    # Extraer atributos principales
+                    fila = {'ID_SISTEMA': item.get('id') or item.findtext('nombre') or item.get('nombre') or f"Elemento_{i}"}
                     for k, v in item.attrib.items(): fila[f"@{k}"] = v
-                    
                     for child in item:
-                        # Extraer listas simples
-                        if child.tag in ['listaDeAulas', 'otrasAulas']: 
-                            fila[child.tag] = ", ".join([c.text for c in child.findall('aula') if c.text])
-                        elif child.tag == 'otrosProfesores': 
-                            fila[child.tag] = ", ".join([c.text for c in child.findall('profesor') if c.text])
-                        elif child.tag == 'otrosGrupos': 
-                            fila[child.tag] = ", ".join([c.text for c in child.findall('grupo') if c.text])
-                        # Extraer nodos vacíos
-                        elif len(child) == 0 and not child.attrib: 
-                            fila[child.tag] = child.text.strip() if child.text else ""
-                        else: 
-                            # Nodo complejo (Restricciones, Plantillas). Se guarda como XML crudo.
-                            fila[child.tag] = etree.tostring(child, encoding='unicode')
+                        if child.tag in ['listaDeAulas', 'otrasAulas']: fila[child.tag] = ", ".join([c.text for c in child.findall('aula') if c.text])
+                        elif child.tag == 'otrosProfesores': fila[child.tag] = ", ".join([c.text for c in child.findall('profesor') if c.text])
+                        elif child.tag == 'otrosGrupos': fila[child.tag] = ", ".join([c.text for c in child.findall('grupo') if c.text])
+                        elif len(child) == 0 and not child.attrib: fila[child.tag] = child.text.strip() if child.text else ""
+                        else: fila[child.tag] = etree.tostring(child, encoding='unicode')
                     registros.append(fila)
-                if registros:
-                    dfs[container.tag.capitalize()] = pd.DataFrame(registros).fillna("")
+                if registros: dfs[container.tag.capitalize()] = pd.DataFrame(registros).fillna("")
         
         xml_bytes = etree.tostring(root, encoding='ISO-8859-1')
         xml_comprimido = base64.b64encode(zlib.compress(xml_bytes)).decode('utf-8')
-        
         db.collection('ghc_sistema').document('plantilla_base').set({'xml_comprimido': xml_comprimido})
         for nombre, df in dfs.items(): guardar_tabla_en_nube(nombre, df)
         
@@ -125,14 +127,23 @@ if st.session_state.xml_tree is None:
         st.session_state.data_frames = dfs
         st.rerun()
 
-# --- PANTALLA PRINCIPAL DE EDICIÓN ---
+# --- INTERFAZ PRINCIPAL ---
 if st.session_state.xml_tree is not None:
-    # --- MENÚ LATERAL MEJORADO (NAVEGACIÓN) ---
-    st.sidebar.markdown("### 🗺️ Menú de Navegación")
+    # --- BARRA LATERAL (NAVEGACIÓN Y CONFIGURACIÓN UX) ---
+    st.sidebar.markdown("### 🗺️ Navegación")
     tab_names = list(st.session_state.data_frames.keys())
+    selected_tab = st.sidebar.radio("Sección actual:", tab_names)
     
-    # Hemos sustituido los st.tabs por un selector en la barra lateral
-    selected_tab = st.sidebar.radio("Selecciona qué sección editar:", tab_names)
+    st.sidebar.divider()
+    
+    # MEJORA UX: Cuadro de configuración de visibilidad de atributos solicitados
+    st.sidebar.markdown("### 👁️ Filtro de Atributos del XML")
+    st.sidebar.caption("Selecciona qué columnas clave deseas visualizar en la tabla principal:")
+    
+    ver_nombre = st.sidebar.checkbox("Nombre completo (@nombre / nombre)", value=True)
+    ver_abreviatura = st.sidebar.checkbox("Abreviatura (@abreviatura / abreviatura)", value=True)
+    ver_identificador = st.sidebar.checkbox("Identificador (@id)", value=True)
+    ver_clave_externa = st.sidebar.checkbox("Clave externa (@claveX / claveExterna)", value=True)
     
     st.sidebar.divider()
     if st.sidebar.button("🚨 Reiniciar Base de Datos", type="secondary"):
@@ -141,69 +152,102 @@ if st.session_state.xml_tree is not None:
         st.rerun()
         
     st.sidebar.divider()
-    # Mover el botón de descarga al menú lateral para no ensuciar la pantalla principal
     st.sidebar.markdown("### 💾 Exportación")
-    btn_descarga = st.sidebar.empty() # Espacio reservado para el botón al final del script
+    btn_descarga = st.sidebar.empty()
 
-    # --- ÁREA PRINCIPAL DE TRABAJO ---
-    df = st.session_state.data_frames[selected_tab]
+    # --- PROCESADO DE VISIBILIDAD DE COLUMNAS ---
+    df_original = st.session_state.data_frames[selected_tab]
     
-    st.markdown(f"### 📋 Gestor de {selected_tab}")
-    st.caption("Edita directamente en las celdas. Los cambios se sincronizan en la nube automáticamente.")
+    # Creamos una lista de columnas que el usuario quiere forzar a OCULTAR si desmarca los checks
+    columnas_a_ocultar = []
     
-    df_editado = st.data_editor(df, use_container_width=True, hide_index=True, key=f"editor_{selected_tab}")
+    # Peñalara suele guardar estos atributos con '@' por ser atributos XML en nuestro DataFrame
+    if not ver_identificador: 
+        columnas_a_ocultar.extend(['@id', 'id'])
+    if not ver_nombre: 
+        columnas_a_ocultar.extend(['@nombre', 'nombre'])
+    if not ver_abreviatura: 
+        columnas_a_ocultar.extend(['@abreviatura', 'abreviatura', '@abrev', 'abrev'])
+    if not ver_clave_externa: 
+        columnas_a_ocultar.extend(['@claveX', 'claveX', '@claveExterna', 'claveExterna', '@clavX', 'clavX'])
+
+    # --- TABLA PRINCIPAL ---
+    st.markdown(f"### 📋 Tabla de {selected_tab}")
+    st.caption("Filtra las columnas visibles desde el panel lateral izquierdo según tus necesidades de edición.")
     
-    if not df_editado.equals(df):
-        st.session_state.data_frames[selected_tab] = df_editado
-        guardar_tabla_en_nube(selected_tab, df_editado)
-        st.toast('☁️ ¡Cambio guardado en la nube!')
-    
-    st.write("")
-    
-    # --- INSPECTOR DE RESTRICCIONES Y ANIDAMIENTO PROFUNDO ---
-    with st.expander(f"🛠️ Editar configuraciones avanzadas y restricciones de {selected_tab}", expanded=False):
-        opciones = df['ID_SISTEMA'].tolist()
-        seleccion = st.selectbox("Elemento a inspeccionar:", ["-- Ninguna --"] + opciones, key="sel_avanzado")
+    # Construimos la interfaz visual aplicando los filtros aplicados
+    df_interfaz = df_original.copy()
+    if "🔍 Ver Anificados" not in df_interfaz.columns: # Mantener compatibilidad de nomenclatura anterior
+        df_interfaz.insert(0, "🔍 Ver Anidados", False)
         
-        if seleccion != "-- Ninguna --":
-            idx = df[df['ID_SISTEMA'] == seleccion].index[0]
-            # Buscamos campos que sean strings XML (donde viven las restricciones)
-            campos_complejos = [col for col in df.columns if isinstance(df.at[idx, col], str) and str(df.at[idx, col]).strip().startswith('<')]
+    # Filtrar activamente eliminando las columnas seleccionadas en el sidebar (si existen en esta tabla)
+    columnas_existentes_a_ocultar = [col for col in columnas_a_ocultar if col in df_interfaz.columns]
+    df_interfaz_filtrada = df_interfaz.drop(columns=columnas_existentes_a_ocultar)
+    
+    # Dibujamos el data_editor con las columnas ya limpias
+    df_editado_filtrado = st.data_editor(
+        df_interfaz_filtrada, 
+        use_container_width=True, 
+        hide_index=True, 
+        key=f"editor_{selected_tab}",
+        column_config={"🔍 Ver Anidados": st.column_config.CheckboxColumn("🔍 Ver Anidados", help="Abre las sub-tablas", default=False)}
+    )
+    
+    # RECONSTRUCCIÓN: Como la tabla editada puede no tener todas las columnas (porque se ocultaron), 
+    # volvemos a fusionar los cambios editados sobre el dataframe original para no perder las columnas ocultas.
+    df_para_guardar = df_original.copy()
+    
+    # Actualizar solo las celdas de las columnas que estaban visibles y que el usuario pudo haber modificado
+    for col in df_editado_filtrado.columns:
+        if col != "🔍 Ver Anidados" and col in df_para_guardar.columns:
+            df_para_guardar[col] = df_editado_filtrado[col]
             
-            if not campos_complejos:
-                st.info("Este elemento no tiene estructuras de restricciones complejas u ocultas. Todo se puede editar desde la tabla superior.")
-            else:
-                st.markdown("### Estructuras Anidadas Encontradas")
-                st.caption("A continuación se muestra el árbol de restricciones completo. Modifica valores o atributos (⚙️).")
-                
-                with st.form(key=f"form_anidado_{seleccion}"):
-                    nuevos_valores_xml = {}
-                    
-                    for col_name in campos_complejos:
-                        valor_actual = str(df.at[idx, col_name])
-                        st.markdown(f"#### 📦 {col_name.capitalize()}")
-                        try:
-                            # Convertimos el texto nuevamente a un árbol XML
-                            sub_tree = etree.fromstring(valor_actual)
-                            # Renderizamos la estructura recursiva infinita
-                            render_recursive_xml_form(sub_tree, path_key=f"{seleccion}_{col_name}")
-                            nuevos_valores_xml[col_name] = sub_tree
-                        except Exception as e:
-                            st.error("Formato XML irreconocible para editor visual.")
-                            nuevos_valores_xml[col_name] = st.text_area(f"Modo Texto", value=valor_actual)
-                            
-                    st.write("")
-                    if st.form_submit_button("💾 Aplicar Cambios Profundos a la Nube", type="primary"):
-                        for col_name, obj in nuevos_valores_xml.items():
-                            if isinstance(obj, str):
-                                st.session_state.data_frames[selected_tab].at[idx, col_name] = obj
-                            else:
-                                st.session_state.data_frames[selected_tab].at[idx, col_name] = etree.tostring(obj, encoding='unicode')
-                        
-                        guardar_tabla_en_nube(selected_tab, st.session_state.data_frames[selected_tab])
-                        st.rerun()
+    # Comprobar si ha cambiado algo realmente para subirlo a Firebase
+    if not df_para_guardar.equals(df_original):
+        st.session_state.data_frames[selected_tab] = df_para_guardar
+        guardar_tabla_en_nube(selected_tab, df_para_guardar)
+        st.toast('☁️ ¡Cambio guardado en la nube!')
 
-    # --- GENERADOR DE DESCARGA PEÑALARA ---
+    # --- LÓGICA DE SUB-TABLAS (DATOS ANIDADOS) ---
+    # Detectamos la fila seleccionada usando la tabla editada
+    filas_marcadas = df_editado_filtrado[df_editado_filtrado["🔍 Ver Anidados"] == True]
+    
+    if not filas_marcadas.empty:
+        idx = filas_marcadas.index[0]
+        id_elemento = df_para_guardar.at[idx, 'ID_SISTEMA']
+        
+        campos_complejos = [col for col in df_para_guardar.columns if isinstance(df_para_guardar.at[idx, col], str) and str(df_para_guardar.at[idx, col]).strip().startswith('<')]
+        
+        st.divider()
+        st.markdown(f"### 🗂️ Sub-Tablas de: `{id_elemento}`")
+        
+        if not campos_complejos:
+            st.info("Este elemento no tiene plantillas, restricciones ni datos aninados complejos.")
+        else:
+            for col_name in campos_complejos:
+                st.markdown(f"#### ↳ Estructura Anidada: `{col_name}`")
+                xml_string = str(df_para_guardar.at[idx, col_name])
+                
+                try:
+                    parent_tag, df_sub = xml_to_df(xml_string)
+                    df_sub_editado = st.data_editor(
+                        df_sub, 
+                        key=f"sub_{selected_tab}_{idx}_{col_name}", 
+                        num_rows="dynamic", 
+                        use_container_width=True
+                    )
+                    
+                    if not df_sub_editado.equals(df_sub):
+                        nuevo_xml = df_to_xml(parent_tag, df_sub_editado)
+                        st.session_state.data_frames[selected_tab].at[idx, col_name] = nuevo_xml
+                        guardar_tabla_en_nube(selected_tab, st.session_state.data_frames[selected_tab])
+                        st.toast("☁️ ¡Sub-tabla guardada!")
+                        st.rerun()
+                        
+                except Exception as e:
+                    st.error(f"Error en sub-tabla {col_name}: {e}")
+
+    # --- EXPORTACIÓN PEÑALARA ---
     root = st.session_state.xml_tree.getroot()
     for tab_name, dataframe_editado in st.session_state.data_frames.items():
         nombre_pestana = tab_name.lower()
@@ -239,7 +283,6 @@ if st.session_state.xml_tree is not None:
                                 if item_val.strip(): etree.SubElement(lista_nodo, tag_interno).text = item_val.strip()
                     else:
                         hijo = nodo.find(col)
-                        # Reinsertar nodos complejos (restricciones) editados
                         if isinstance(valor_str, str) and valor_str.startswith('<') and valor_str.endswith('>'):
                             try:
                                 nuevo_hijo = etree.fromstring(valor_str)
@@ -254,6 +297,5 @@ if st.session_state.xml_tree is not None:
                         elif valor_str: etree.SubElement(nodo, col).text = valor_str
 
     xml_str = etree.tostring(root, encoding='ISO-8859-1', xml_declaration=True, pretty_print=True)
-    # Colocamos el botón en el menú lateral usando el hueco reservado
     with btn_descarga:
         st.download_button(label="📥 DESCARGAR PLANIFICADOR.XML", data=xml_str, file_name="PLANIFICADOR_NUBE.xml", mime="application/xml", use_container_width=True)
