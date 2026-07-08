@@ -56,7 +56,6 @@ def xml_to_df(xml_str):
             row[f"@{k}"] = v
             
         if len(child) > 0:
-            # Envolvemos los hijos en una etiqueta sintética para que sea un XML válido en el siguiente nivel
             hijos_str = "".join([etree.tostring(c, encoding='unicode') for c in child])
             row['Sub_Nodos_Ocultos'] = f"<Nodos_{child.tag}>{hijos_str}</Nodos_{child.tag}>"
             
@@ -86,7 +85,6 @@ def df_to_xml(parent_tag, df):
                 sub_val = str(row.get(col, '')).strip()
                 if sub_val and sub_val.lower() != 'nan':
                     try:
-                        # Extraer hijos de la etiqueta sintética
                         sub_tree = etree.fromstring(sub_val)
                         for sub_c in sub_tree: child.append(sub_c)
                     except: pass
@@ -111,26 +109,21 @@ def renderizar_anidados(xml_string, id_unico, titulo_padre, callback_guardar):
             column_config={"🔍 Ver Anidados": st.column_config.CheckboxColumn("🔍 Ver Anidados", default=False)}
         )
         
-        # Guardar si hubo cambios en los datos (ignorando la columna del checkbox)
         df_para_comprobar = df_editado.drop(columns=["🔍 Ver Anidados"])
         if not df_para_comprobar.equals(df_sub):
             nuevo_xml = df_to_xml(parent_tag, df_para_comprobar)
             callback_guardar(nuevo_xml)
             st.rerun()
             
-        # Llamada recursiva si el usuario quiere ver los sub-hijos de este nivel
         filas_marcadas = df_editado[df_editado["🔍 Ver Anidados"] == True]
         if not filas_marcadas.empty:
             idx = filas_marcadas.index[0]
-            # Detectamos si la fila seleccionada tiene contenido complejo
             cols_complejas = [c for c in df_para_comprobar.columns if isinstance(df_para_comprobar.at[idx, c], str) and df_para_comprobar.at[idx, c].strip().startswith('<')]
             
             if cols_complejas:
                 with st.container(border=True):
                     for col_name in cols_complejas:
                         sub_str = str(df_para_comprobar.at[idx, col_name])
-                        
-                        # Definimos cómo el hijo avisa al padre de un cambio
                         def crear_callback(r_idx=idx, r_col=col_name):
                             def cb(nuevo_sub):
                                 df_actualizado = df_para_comprobar.copy()
@@ -138,7 +131,6 @@ def renderizar_anidados(xml_string, id_unico, titulo_padre, callback_guardar):
                                 xml_padre = df_to_xml(parent_tag, df_actualizado)
                                 callback_guardar(xml_padre)
                             return cb
-                            
                         renderizar_anidados(sub_str, f"{id_unico}_{idx}_{col_name}", col_name, crear_callback())
     except Exception as e:
         st.error(f"Error renderizando el anidado {titulo_padre}: {e}")
@@ -160,7 +152,7 @@ def mostrar_ayuda():
     *   Marca el checkbox **🔍 Ver Anidados** a la izquierda de la fila y se desplegará una nueva tabla debajo para editar esos componentes de forma cómoda. ¡Puedes hacerlo tantas veces como quieras hacia adentro!
     
     **Filtros Visuales**
-    *   Para limpiar la pantalla de datos técnicos (como `@clavX` o `@id`), desmarca sus casillas en el menú lateral.
+    *   Para limpiar la pantalla de datos técnicos, desmarca sus casillas en el menú lateral.
     
     **Descarga**
     *   Pulsa **📥 Descargar PLANIFICADOR.XML** para generar tu archivo compatible de vuelta a la aplicación de Peñalara.
@@ -184,16 +176,25 @@ if st.session_state.xml_tree is None:
         
         for container in root:
             if len(container) > 0:
-                tag_hijo = container[0].tag
                 registros = []
-                for i, item in enumerate(container.findall(tag_hijo)):
-                    fila = {'ID_SISTEMA': item.get('id') or item.findtext('nombre') or item.get('nombre') or f"Elemento_{i}"}
+                # Iteramos directamente sobre los hijos sin asumir que todos comparten la misma etiqueta
+                for i, item in enumerate(container):
+                    if not isinstance(item.tag, str): continue # Ignorar comentarios XML
+                    
+                    # CORRECCIÓN CLAVE: Prioridad absoluta a la 'abreviatura' (tanto atributo como nodo texto)
+                    val_id = item.get('abreviatura') or item.get('abrev') or item.findtext('abreviatura') or \
+                             item.get('id') or item.findtext('nombre') or item.get('nombre') or f"Elemento_{i}"
+                             
+                    fila = {
+                        'ID_SISTEMA': val_id,
+                        '__TAG_REAL__': item.tag # Guardamos la etiqueta real de forma oculta para asegurar la exportación
+                    }
+                    
                     for k, v in item.attrib.items(): 
                         fila[f"@{k}"] = v
                         
                     hijos_agrupados = {}
                     for child in item:
-                        # Reglas heurísticas de GHC para listas planas
                         if child.tag in ['listaDeAulas', 'otrasAulas']: 
                             val = ", ".join([c.text for c in child.findall('aula') if c.text])
                         elif child.tag == 'otrosProfesores': 
@@ -201,30 +202,23 @@ if st.session_state.xml_tree is None:
                         elif child.tag == 'otrosGrupos': 
                             val = ", ".join([c.text for c in child.findall('grupo') if c.text])
                         else:
-                            # Extracción general segura
                             val = child.get('clavX') or child.get('id') or child.text
                             if not val and child.attrib:
                                 val = list(child.attrib.values())[0]
-                                
-                            # Si es un nodo muy complejo (con hijos)
                             if not val and len(child) > 0:
                                 val = etree.tostring(child, encoding='unicode')
                             elif not val:
                                 val = ""
                         
-                        # Acumular etiquetas repetidas sin sobrescribirlas (Solución al corte de aulas)
                         if child.tag in hijos_agrupados:
                             hijos_agrupados[child.tag].append(str(val))
                         else:
                             hijos_agrupados[child.tag] = [str(val)]
                     
-                    # Convertir los grupos acumulados al diccionario final de Pandas
                     for tag, lista_vals in hijos_agrupados.items():
                         if all(v.startswith('<') for v in lista_vals if v):
-                            # Si todos son complejos, envolverlos para el renderizador anidado
                             fila[tag] = f"<Nodos_{tag}>" + "".join(lista_vals) + f"</Nodos_{tag}>"
                         else:
-                            # Aplanar listas en comas para fácil lectura (12, 14, B4)
                             fila[tag] = ", ".join([v for v in lista_vals if v])
                             
                     registros.append(fila)
@@ -243,7 +237,6 @@ if st.session_state.xml_tree is None:
 
 # --- INTERFAZ PRINCIPAL ---
 if st.session_state.xml_tree is not None:
-    # --- BARRA LATERAL (NAVEGACIÓN Y AYUDA) ---
     st.sidebar.markdown("### 🗺️ Navegación")
     
     if st.sidebar.button("❓ Guía de Uso", type="primary"):
@@ -276,7 +269,7 @@ if st.session_state.xml_tree is not None:
 
     # --- TABLA PRINCIPAL ---
     df_original = st.session_state.data_frames[selected_tab]
-    columnas_a_ocultar = []
+    columnas_a_ocultar = ['__TAG_REAL__'] # Siempre ocultamos la etiqueta interna técnica
     
     if not ver_identificador: columnas_a_ocultar.extend(['@id', 'id'])
     if not ver_nombre: columnas_a_ocultar.extend(['@nombre', 'nombre'])
@@ -300,7 +293,6 @@ if st.session_state.xml_tree is not None:
         column_config={"🔍 Ver Anidados": st.column_config.CheckboxColumn("🔍 Ver Anidados", help="Abre las sub-tablas", default=False)}
     )
     
-    # Procesar guardado principal
     df_para_guardar = df_original.copy()
     for col in df_editado_filtrado.columns:
         if col != "🔍 Ver Anidados" and col in df_para_guardar.columns:
@@ -311,7 +303,7 @@ if st.session_state.xml_tree is not None:
         guardar_tabla_en_nube(selected_tab, df_para_guardar)
         st.toast('☁️ ¡Cambio guardado en la nube!')
 
-    # --- LÓGICA DE DETECCIÓN DE ANIDADOS (Conecta con la recursividad) ---
+    # --- LÓGICA DE DETECCIÓN DE ANIDADOS ---
     filas_marcadas = df_editado_filtrado[df_editado_filtrado["🔍 Ver Anidados"] == True]
     
     if not filas_marcadas.empty:
@@ -328,7 +320,6 @@ if st.session_state.xml_tree is not None:
             for col_name in campos_complejos:
                 xml_string = str(df_para_guardar.at[idx, col_name])
                 
-                # Definir Callback para el nivel 0
                 def callback_nivel_cero(nuevo_xml, index_padre=idx, columna_padre=col_name):
                     st.session_state.data_frames[selected_tab].at[index_padre, columna_padre] = nuevo_xml
                     guardar_tabla_en_nube(selected_tab, st.session_state.data_frames[selected_tab])
@@ -336,23 +327,35 @@ if st.session_state.xml_tree is not None:
                 
                 renderizar_anidados(xml_string, f"sub_{selected_tab}_{idx}_{col_name}", col_name, callback_nivel_cero)
 
-    # --- EXPORTACIÓN REPARADA (Soporte Multi-Aula/Multi-Tramos) ---
+    # --- EXPORTACIÓN REPARADA (Soporte Abreviaturas) ---
     root = st.session_state.xml_tree.getroot()
     for tab_name, dataframe_editado in st.session_state.data_frames.items():
         nombre_pestana = tab_name.lower()
         container = root.find(nombre_pestana)
         if container is None: continue
-        tag_hijo = container[0].tag
         
         for fila in dataframe_editado.to_dict('records'):
             id_sistema = str(fila.get('ID_SISTEMA', ''))
-            if not id_sistema or id_sistema.startswith("Elemento_"): continue
+            tag_hijo = str(fila.get('__TAG_REAL__', container[0].tag if len(container)>0 else '*'))
             
-            nodo = container.find(f"{tag_hijo}[@id='{id_sistema}']") or container.find(f"{tag_hijo}[nombre='{id_sistema}']") or container.find(f"{tag_hijo}[@nombre='{id_sistema}']") or container.find(f"{tag_hijo}[@abreviatura='{id_sistema}']")
+            # Se ha eliminado el skip de "Elemento_", procesamos todo. Buscamos priorizando abreviatura
+            nodo = container.find(f"{tag_hijo}[@abreviatura='{id_sistema}']") or \
+                   container.find(f"{tag_hijo}[abreviatura='{id_sistema}']") or \
+                   container.find(f"{tag_hijo}[@abrev='{id_sistema}']") or \
+                   container.find(f"{tag_hijo}[@id='{id_sistema}']") or \
+                   container.find(f"{tag_hijo}[nombre='{id_sistema}']") or \
+                   container.find(f"{tag_hijo}[@nombre='{id_sistema}']")
+                   
+            # Si a pesar de todo no lo encuentra por ID, probamos por el índice (fallback seguro)
+            if nodo is None and id_sistema.startswith("Elemento_"):
+                try:
+                    idx_nodo = int(id_sistema.split("_")[1])
+                    nodo = container[idx_nodo]
+                except: pass
                 
             if nodo is not None:
                 for col, valor in fila.items():
-                    if col == 'ID_SISTEMA': continue
+                    if col in ['ID_SISTEMA', '__TAG_REAL__']: continue
                     valor_str = str(valor).strip()
                     
                     if col.startswith('@'): 
@@ -376,16 +379,12 @@ if st.session_state.xml_tree is not None:
                                 if item_val.strip(): etree.SubElement(lista_nodo, tag_interno).text = item_val.strip()
                                 
                     else:
-                        # Extraer hermanos previos del XML base para inferir la estructura
                         nodos_hermanos = nodo.findall(col)
                         
-                        # Inserciones complejas (reconstrucción de Sub_Nodos)
                         if isinstance(valor_str, str) and valor_str.startswith('<') and valor_str.endswith('>'):
                             try:
                                 nuevo_hijo = etree.fromstring(valor_str)
                                 for old in nodos_hermanos: nodo.remove(old)
-                                
-                                # Si es un Wrapper sintético generado por nosotros, extraer sus hijos
                                 if nuevo_hijo.tag.startswith('Nodos_'):
                                     for child_node in nuevo_hijo: nodo.append(child_node)
                                 else:
@@ -393,11 +392,8 @@ if st.session_state.xml_tree is not None:
                                 continue
                             except: pass
                             
-                        # Limpiar antes de re-insertar
                         for n in nodos_hermanos: nodo.remove(n)
                         
-                        # Separación de elementos iterativos (ej. Aulas de un conjunto)
-                        # No restringimos con .isdigit() para permitir IDs como "B4", "Música"
                         list_tags_frecuentes = ['aula', 'profesor', 'grupo', 'materia', 'tramo', 'sesion']
                         es_multi = (len(nodos_hermanos) > 1) or (col in list_tags_frecuentes)
                         
@@ -406,7 +402,6 @@ if st.session_state.xml_tree is not None:
                                 v_limpio = v.strip()
                                 if v_limpio:
                                     nuevo_elem = etree.SubElement(nodo, col)
-                                    # Conservar la lógica original de GHC: priorizar clavX
                                     if nodos_hermanos and nodos_hermanos[0].get('clavX'):
                                         nuevo_elem.set('clavX', v_limpio)
                                     elif nodos_hermanos and nodos_hermanos[0].get('id'):
