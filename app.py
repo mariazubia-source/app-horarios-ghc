@@ -22,8 +22,13 @@ def iniciar_conexion_bd():
 
 db = iniciar_conexion_bd()
 
+# --- FUNCIONES DE ALMACENAMIENTO COMPRIMIDO ---
 def guardar_tabla_en_nube(nombre_tabla, dataframe):
-    db.collection('ghc_tablas').document(nombre_tabla).set({'datos': dataframe.to_dict('records')})
+    # Convertimos el DataFrame a JSON, lo pasamos a bytes, lo comprimimos y lo codificamos
+    json_str = json.dumps(dataframe.to_dict('records'))
+    json_bytes = json_str.encode('utf-8')
+    comprimido = base64.b64encode(zlib.compress(json_bytes)).decode('utf-8')
+    db.collection('ghc_tablas').document(nombre_tabla).set({'datos_comprimidos': comprimido})
 
 def cargar_datos_de_nube():
     doc_xml = db.collection('ghc_sistema').document('plantilla_base').get()
@@ -36,13 +41,25 @@ def cargar_datos_de_nube():
         xml_bytes = zlib.decompress(base64.b64decode(xml_comprimido))
         tree = etree.ElementTree(etree.fromstring(xml_bytes))
     except Exception as e:
-        st.error(f"Error al descomprimir: {e}")
+        st.error(f"Error al descomprimir el XML base: {e}")
         return None, None
     
     coleccion = db.collection('ghc_tablas').stream()
     dfs = {}
     for doc in coleccion:
-        dfs[doc.id] = pd.DataFrame(doc.to_dict().get('datos', [])).fillna("")
+        datos_tabla = doc.to_dict()
+        if 'datos_comprimidos' in datos_tabla:
+            # Si está comprimido, hacemos el proceso inverso
+            try:
+                json_bytes = zlib.decompress(base64.b64decode(datos_tabla['datos_comprimidos']))
+                lista_datos = json.loads(json_bytes.decode('utf-8'))
+                dfs[doc.id] = pd.DataFrame(lista_datos).fillna("")
+            except Exception as e:
+                st.error(f"Error al descomprimir la tabla {doc.id}: {e}")
+        else:
+            # Mantiene compatibilidad por si alguna tabla antigua no estaba comprimida
+            dfs[doc.id] = pd.DataFrame(datos_tabla.get('datos', [])).fillna("")
+            
     return tree, dfs
 
 # --- CONVERSORES DE XML A SUB-TABLAS (NIVEL PROFUNDO) ---
@@ -140,22 +157,17 @@ def renderizar_anidados(xml_string, id_unico, titulo_padre, callback_guardar):
 def mostrar_ayuda():
     st.markdown("""
     **Navegación General**
-    *   Usa la barra lateral izquierda para moverte entre las diferentes estructuras (Marcos de horario, Aulas, Sesiones, etc.).
+    *   Usa la barra lateral izquierda para moverte entre las diferentes estructuras.
     
     **Edición y Guardado**
-    *   Haz doble clic sobre cualquier celda de la tabla para editar su valor.
-    *   Las agrupaciones de datos (como varias aulas en un *Conjunto de Aulas*) se muestran separadas por comas (ej. `12, 14, B4`). Edítalas manteniendo ese formato.
-    *   Los cambios se **guardan solos en la nube** al hacer clic fuera de la celda.
+    *   Haz doble clic sobre cualquier celda para editar su valor.
+    *   Los cambios se **guardan solos en la nube**.
     
     **El Checkbox "🔍 Ver Anidados"**
-    *   Si ves columnas con texto técnico como `<Nodos_...>`, significa que hay sub-elementos complejos ahí dentro.
-    *   Marca el checkbox **🔍 Ver Anidados** a la izquierda de la fila y se desplegará una nueva tabla debajo para editar esos componentes de forma cómoda. ¡Puedes hacerlo tantas veces como quieras hacia adentro!
-    
-    **Filtros Visuales**
-    *   Para limpiar la pantalla de datos técnicos, desmarca sus casillas en el menú lateral.
+    *   Marca el checkbox **🔍 Ver Anidados** a la izquierda de la fila y se desplegará una nueva tabla debajo para editar sus componentes internos (como las aulas de un conjunto).
     
     **Descarga**
-    *   Pulsa **📥 Descargar PLANIFICADOR.XML** para generar tu archivo compatible de vuelta a la aplicación de Peñalara.
+    *   Pulsa **📥 Descargar PLANIFICADOR.XML** para generar tu archivo de vuelta a Peñalara.
     """)
 
 # --- INICIO DE SESIÓN ---
@@ -177,17 +189,15 @@ if st.session_state.xml_tree is None:
         for container in root:
             if len(container) > 0:
                 registros = []
-                # Iteramos directamente sobre los hijos sin asumir que todos comparten la misma etiqueta
                 for i, item in enumerate(container):
-                    if not isinstance(item.tag, str): continue # Ignorar comentarios XML
+                    if not isinstance(item.tag, str): continue # Ignorar comentarios
                     
-                    # CORRECCIÓN CLAVE: Prioridad absoluta a la 'abreviatura' (tanto atributo como nodo texto)
                     val_id = item.get('abreviatura') or item.get('abrev') or item.findtext('abreviatura') or \
                              item.get('id') or item.findtext('nombre') or item.get('nombre') or f"Elemento_{i}"
                              
                     fila = {
                         'ID_SISTEMA': val_id,
-                        '__TAG_REAL__': item.tag # Guardamos la etiqueta real de forma oculta para asegurar la exportación
+                        '__TAG_REAL__': item.tag 
                     }
                     
                     for k, v in item.attrib.items(): 
@@ -226,10 +236,13 @@ if st.session_state.xml_tree is None:
                 if registros: 
                     dfs[container.tag.capitalize()] = pd.DataFrame(registros).fillna("")
         
+        # Guardado inicial masivo con compresión para evitar límite de Firebase
         xml_bytes = etree.tostring(root, encoding='ISO-8859-1')
         xml_comprimido = base64.b64encode(zlib.compress(xml_bytes)).decode('utf-8')
         db.collection('ghc_sistema').document('plantilla_base').set({'xml_comprimido': xml_comprimido})
-        for nombre, df in dfs.items(): guardar_tabla_en_nube(nombre, df)
+        
+        for nombre, df in dfs.items(): 
+            guardar_tabla_en_nube(nombre, df)
         
         st.session_state.xml_tree = tree
         st.session_state.data_frames = dfs
@@ -269,7 +282,7 @@ if st.session_state.xml_tree is not None:
 
     # --- TABLA PRINCIPAL ---
     df_original = st.session_state.data_frames[selected_tab]
-    columnas_a_ocultar = ['__TAG_REAL__'] # Siempre ocultamos la etiqueta interna técnica
+    columnas_a_ocultar = ['__TAG_REAL__']
     
     if not ver_identificador: columnas_a_ocultar.extend(['@id', 'id'])
     if not ver_nombre: columnas_a_ocultar.extend(['@nombre', 'nombre'])
@@ -301,7 +314,7 @@ if st.session_state.xml_tree is not None:
     if not df_para_guardar.equals(df_original):
         st.session_state.data_frames[selected_tab] = df_para_guardar
         guardar_tabla_en_nube(selected_tab, df_para_guardar)
-        st.toast('☁️ ¡Cambio guardado en la nube!')
+        st.toast('☁️ ¡Cambio guardado en la nube de forma comprimida!')
 
     # --- LÓGICA DE DETECCIÓN DE ANIDADOS ---
     filas_marcadas = df_editado_filtrado[df_editado_filtrado["🔍 Ver Anidados"] == True]
@@ -327,7 +340,7 @@ if st.session_state.xml_tree is not None:
                 
                 renderizar_anidados(xml_string, f"sub_{selected_tab}_{idx}_{col_name}", col_name, callback_nivel_cero)
 
-    # --- EXPORTACIÓN REPARADA (Soporte Abreviaturas) ---
+    # --- EXPORTACIÓN REPARADA ---
     root = st.session_state.xml_tree.getroot()
     for tab_name, dataframe_editado in st.session_state.data_frames.items():
         nombre_pestana = tab_name.lower()
@@ -338,7 +351,6 @@ if st.session_state.xml_tree is not None:
             id_sistema = str(fila.get('ID_SISTEMA', ''))
             tag_hijo = str(fila.get('__TAG_REAL__', container[0].tag if len(container)>0 else '*'))
             
-            # Se ha eliminado el skip de "Elemento_", procesamos todo. Buscamos priorizando abreviatura
             nodo = container.find(f"{tag_hijo}[@abreviatura='{id_sistema}']") or \
                    container.find(f"{tag_hijo}[abreviatura='{id_sistema}']") or \
                    container.find(f"{tag_hijo}[@abrev='{id_sistema}']") or \
@@ -346,7 +358,6 @@ if st.session_state.xml_tree is not None:
                    container.find(f"{tag_hijo}[nombre='{id_sistema}']") or \
                    container.find(f"{tag_hijo}[@nombre='{id_sistema}']")
                    
-            # Si a pesar de todo no lo encuentra por ID, probamos por el índice (fallback seguro)
             if nodo is None and id_sistema.startswith("Elemento_"):
                 try:
                     idx_nodo = int(id_sistema.split("_")[1])
