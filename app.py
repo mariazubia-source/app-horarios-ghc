@@ -102,21 +102,52 @@ if st.session_state.xml_tree is None:
         tree = etree.parse(uploaded_file, parser)
         root = tree.getroot()
         dfs = {}
+        
         for container in root:
             if len(container) > 0:
                 tag_hijo = container[0].tag
                 registros = []
                 for i, item in enumerate(container.findall(tag_hijo)):
                     fila = {'ID_SISTEMA': item.get('id') or item.findtext('nombre') or item.get('nombre') or f"Elemento_{i}"}
-                    for k, v in item.attrib.items(): fila[f"@{k}"] = v
+                    for k, v in item.attrib.items(): 
+                        fila[f"@{k}"] = v
+                        
+                    # LÓGICA CORREGIDA: Agrupar etiquetas repetidas (como <aula>) para no sobrescribirlas
+                    hijos_agrupados = {}
+                    
                     for child in item:
-                        if child.tag in ['listaDeAulas', 'otrasAulas']: fila[child.tag] = ", ".join([c.text for c in child.findall('aula') if c.text])
-                        elif child.tag == 'otrosProfesores': fila[child.tag] = ", ".join([c.text for c in child.findall('profesor') if c.text])
-                        elif child.tag == 'otrosGrupos': fila[child.tag] = ", ".join([c.text for c in child.findall('grupo') if c.text])
-                        elif len(child) == 0 and not child.attrib: fila[child.tag] = child.text.strip() if child.text else ""
-                        else: fila[child.tag] = etree.tostring(child, encoding='unicode')
+                        if child.tag in ['listaDeAulas', 'otrasAulas']: 
+                            fila[child.tag] = ", ".join([c.text for c in child.findall('aula') if c.text])
+                        elif child.tag == 'otrosProfesores': 
+                            fila[child.tag] = ", ".join([c.text for c in child.findall('profesor') if c.text])
+                        elif child.tag == 'otrosGrupos': 
+                            fila[child.tag] = ", ".join([c.text for c in child.findall('grupo') if c.text])
+                        else:
+                            # Extraer el valor dependiendo de si es texto, atributo o subnodo
+                            if len(child) == 0 and not child.attrib: 
+                                val = child.text.strip() if child.text else ""
+                            else:
+                                val = child.get('clavX') or child.get('id') or child.text
+                                if not val and len(child) > 0:
+                                    val = etree.tostring(child, encoding='unicode')
+                                elif not val:
+                                    val = ""
+                            
+                            # Si la etiqueta ya existe en el diccionario, la añadimos a una lista
+                            if child.tag in hijos_agrupados:
+                                hijos_agrupados[child.tag].append(str(val))
+                            else:
+                                hijos_agrupados[child.tag] = [str(val)]
+                    
+                    # Convertimos las listas agrupadas en strings separados por comas
+                    for tag, lista_vals in hijos_agrupados.items():
+                        # Si solo hay uno, extrae el valor; si hay varios, únelos con comas
+                        fila[tag] = ", ".join([v for v in lista_vals if v]) if len(lista_vals) > 1 else lista_vals[0]
+                        
                     registros.append(fila)
-                if registros: dfs[container.tag.capitalize()] = pd.DataFrame(registros).fillna("")
+                    
+                if registros: 
+                    dfs[container.tag.capitalize()] = pd.DataFrame(registros).fillna("")
         
         xml_bytes = etree.tostring(root, encoding='ISO-8859-1')
         xml_comprimido = base64.b64encode(zlib.compress(xml_bytes)).decode('utf-8')
@@ -177,7 +208,7 @@ if st.session_state.xml_tree is not None:
     
     # Construimos la interfaz visual aplicando los filtros aplicados
     df_interfaz = df_original.copy()
-    if "🔍 Ver Anificados" not in df_interfaz.columns: # Mantener compatibilidad de nomenclatura anterior
+    if "🔍 Ver Anidados" not in df_interfaz.columns: 
         df_interfaz.insert(0, "🔍 Ver Anidados", False)
         
     # Filtrar activamente eliminando las columnas seleccionadas en el sidebar (si existen en esta tabla)
@@ -265,7 +296,10 @@ if st.session_state.xml_tree is not None:
                 for col, valor in fila.items():
                     if col == 'ID_SISTEMA': continue
                     valor_str = str(valor).strip()
-                    if col.startswith('@'): nodo.set(col[1:], valor_str)
+                    
+                    if col.startswith('@'): 
+                        nodo.set(col[1:], valor_str)
+                        
                     elif col in ['listaDeAulas', 'otrasAulas']:
                         lista_nodo = nodo.find(col)
                         if lista_nodo is None and valor_str: lista_nodo = etree.SubElement(nodo, col)
@@ -273,6 +307,7 @@ if st.session_state.xml_tree is not None:
                             for c in list(lista_nodo): lista_nodo.remove(c)
                             for a in valor_str.split(','):
                                 if a.strip(): etree.SubElement(lista_nodo, 'aula').text = a.strip()
+                                
                     elif col in ['otrosProfesores', 'otrosGrupos']:
                         tag_interno = 'profesor' if col == 'otrosProfesores' else 'grupo'
                         lista_nodo = nodo.find(col)
@@ -281,8 +316,11 @@ if st.session_state.xml_tree is not None:
                             for c in list(lista_nodo): lista_nodo.remove(c)
                             for item_val in valor_str.split(','):
                                 if item_val.strip(): etree.SubElement(lista_nodo, tag_interno).text = item_val.strip()
+                                
                     else:
                         hijo = nodo.find(col)
+                        
+                        # Manejo de estructuras anidadas complejas
                         if isinstance(valor_str, str) and valor_str.startswith('<') and valor_str.endswith('>'):
                             try:
                                 nuevo_hijo = etree.fromstring(valor_str)
@@ -291,10 +329,32 @@ if st.session_state.xml_tree is not None:
                                 continue
                             except: pass
                             
+                        # LÓGICA CORREGIDA PARA EXPORTACIÓN DE LISTAS (como las de aulas que ahora están agrupadas por comas)
                         if hijo is not None:
-                            for c in list(hijo): hijo.remove(c)
-                            hijo.text = valor_str
-                        elif valor_str: etree.SubElement(nodo, col).text = valor_str
+                            # Limpiamos todos los hijos que se llamen igual (ej. limpiamos las <aula> viejas)
+                            nodos_hermanos = nodo.findall(col)
+                            for n in nodos_hermanos:
+                                nodo.remove(n)
+                                
+                            # Si hay comas, creamos varios nodos
+                            if "," in valor_str and valor_str.replace(",", "").strip().isdigit():
+                                for v in valor_str.split(','):
+                                    if v.strip(): 
+                                        nuevo_elem = etree.SubElement(nodo, col)
+                                        # Asignamos al atributo clavX (típico de Peñalara)
+                                        nuevo_elem.set('clavX', v.strip())
+                            else:
+                                nuevo_elem = etree.SubElement(nodo, col)
+                                nuevo_elem.text = valor_str
+                                
+                        elif valor_str: 
+                            if "," in valor_str and valor_str.replace(",", "").strip().isdigit():
+                                for v in valor_str.split(','):
+                                    if v.strip():
+                                        nuevo_elem = etree.SubElement(nodo, col)
+                                        nuevo_elem.set('clavX', v.strip())
+                            else:
+                                etree.SubElement(nodo, col).text = valor_str
 
     xml_str = etree.tostring(root, encoding='ISO-8859-1', xml_declaration=True, pretty_print=True)
     with btn_descarga:
